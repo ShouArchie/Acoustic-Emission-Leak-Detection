@@ -2,7 +2,16 @@
 
 **Real-time high-speed piezoelectric sensor visualizer**
 
-This application acquires 200 kHz voltage data from a Raspberry Pi Pico over USB, stores the stream in a lock-free circular buffer, and displays both the live waveform and its FFT using a Rust egui/eframe desktop GUI. Designed for leak detection within piping systems.
+This application acquires 200 kHz voltage data from a Raspberry Pi Pico over USB, stores the stream in a lock-free circular buffer, and displays both the live waveform and its FFT using a Rust egui/eframe desktop GUI. 
+
+## This Program is Designed for Acoustic-Emission Leak Detection
+
+Acoustic emission (AE) sensors pick up micro-stress waves (typically 10–100 kHz) that occur when pressurised fluid escapes through tiny cracks, pin-holes or faulty welds. This application hopes to stream those high-frequency voltage signals from the Pico to your desktop in real-time so you can:
+
+* Visualise the raw waveform and its FFT while you move the sensor along a pipe.
+* Spot burst-type events or persistent tones that correlate with leaks.
+
+> **Project goal:** evolve the monitor into a complete AE leak-detection platform, adding on-device CNN/RNN inference (see Roadmap) for autonomous leak classification, multi channel AE inputs
 
 ---
 
