@@ -1,1 +1,16 @@
-/target
+# Rust build artifacts
+rust/target/
+
+# Pico firmware build directory
+pico/build/
+
+pico/CMakeLists.txt
+
+# Firmware binaries (in case they appear elsewhere)
+*.uf2
+*.bin
+*.elf
+
+# Misc
+.DS_Store
+Thumbs.db
