@@ -24,7 +24,10 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use ringbuffer::{AllocRingBuffer, RingBuffer};
 use realfft::RealFftPlanner;
+use dotenvy::dotenv;
+// postgres handled in db module
 
+mod db;
 
 const BUFFER_SIZE: usize = 1_000_000; // 10 seconds at 200kHz
 const DISPLAY_SAMPLES: usize = 400_000; // Show last 0.5 seconds at 200kHz on screen
@@ -62,11 +65,22 @@ struct HighPerfDataCollector {
     
     // Serial connection
     running: Arc<Mutex<bool>>,
+    db_sender: Sender<DataBatch>,
+    collect_training: Arc<Mutex<bool>>,
+    window_sender: Sender<DataBatch>,
 }
 
 impl HighPerfDataCollector {
     fn new() -> Self {
         let (sender, receiver) = unbounded();
+        let (db_tx, db_rx) = unbounded();
+        let (win_tx, win_rx) = unbounded();
+        let collect_flag = Arc::new(Mutex::new(false));
+
+        // start db writer thread
+        let conn_str = std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://pico:pass@localhost:5432/piezo_data".to_string());
+        db::start_db_writer(db_rx, conn_str.clone());
+        db::start_window_writer(win_rx, conn_str.clone(), collect_flag.clone());
         
         Self {
             voltage_buffer: Arc::new(Mutex::new(AllocRingBuffer::new(BUFFER_SIZE))),
@@ -80,6 +94,9 @@ impl HighPerfDataCollector {
             data_sender: sender,
             data_receiver: receiver,
             running: Arc::new(Mutex::new(false)),
+            db_sender: db_tx,
+            collect_training: collect_flag,
+            window_sender: win_tx,
         }
     }
     
@@ -242,20 +259,21 @@ impl HighPerfDataCollector {
         let current_time_offset = self.current_time_offset.clone();
         let running = self.running.clone();
         let sample_rate = self.sample_rate;
+        let db_sender = self.db_sender.clone();
+        let window_sender = self.window_sender.clone();
         
         thread::spawn(move || {
             println!("Starting data processing thread");
-            
-            // Track previous batch-ID to detect missing packets
+        
             let mut last_id: Option<u32> = None;
-            // Timing diagnostics: measure wall-clock time over 100 batches
+            
             let mut t0_wall: Option<Instant> = None;
             let mut id0: u32 = 0;
             
+
             while *running.lock().unwrap() {
                 match receiver.recv_timeout(Duration::from_millis(25)) { // Faster processing for 60kHz
                     Ok(batch) => {
-                        // --- Check for skipped batch IDs ---
                         if let Some(prev) = last_id {
                             let diff = batch.batch_id.wrapping_sub(prev);
                             if diff != 1 {
@@ -322,6 +340,11 @@ impl HighPerfDataCollector {
                                 id0 = batch.batch_id;
                             }
                         }
+
+                         let _ = window_sender.send(batch.clone());
+                         if let Err(e) = db_sender.send(batch) {
+                             eprintln!("DB insert error: {}", e);
+                         }
                     }
                     Err(_) => {
                         continue;
@@ -389,6 +412,15 @@ impl HighPerfDataCollector {
         
         (total, batches, est_rate, since_last)
     }
+
+    fn start_training_collection(&self, conn_str: &str) {
+        *self.collect_training.lock().unwrap() = true;
+        db::truncate_windows(conn_str);
+    }
+
+    fn stop_training_collection(&self) {
+        *self.collect_training.lock().unwrap() = false;
+    }
 }
 
 struct PiezoMonitorApp {
@@ -401,6 +433,7 @@ struct PiezoMonitorApp {
     downsample_factor: usize,
     auto_scale: bool,
     show_fft: bool,
+    collecting_training: bool,
     
     // FFT processing
     fft_planner: RealFftPlanner<f32>,
@@ -428,6 +461,7 @@ impl PiezoMonitorApp {
             downsample_factor: 1,
             auto_scale: true,
             show_fft: true,
+            collecting_training: false,
             fft_planner,
             fft_buffer,
             fft_output,
@@ -474,12 +508,14 @@ impl PiezoMonitorApp {
 
 impl eframe::App for PiezoMonitorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Request repaint for smooth updates
         ctx.request_repaint_after(Duration::from_millis(UPDATE_RATE_MS));
         
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Piezo Monitor");
             
+            // Sync collecting flag in case auto-stop changed it
+            self.collecting_training = *self.collector.collect_training.lock().unwrap();
+
             // Control panel
             ui.horizontal(|ui| {
                 if !self.connected {
@@ -524,6 +560,19 @@ impl eframe::App for PiezoMonitorApp {
                 let status_color = if since_last < 2.0 { egui::Color32::GREEN } else { egui::Color32::RED };
                 ui.colored_label(status_color, if since_last < 2.0 { "🟢 LIVE" } else { "🔴 STALE" });
             });
+
+            if !self.collecting_training {
+                if ui.button("📥 Collect Training Set").clicked() {
+                    let conn_str = std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://pico:pass@localhost:5432/piezo_data".to_string());
+                    self.collector.start_training_collection(&conn_str);
+                    self.collecting_training = true;
+                }
+            } else {
+                if ui.button("⏹ Stop Collecting Training").clicked() {
+                    self.collector.stop_training_collection();
+                    self.collecting_training = false;
+                }
+            }
             
             ui.separator();
             
@@ -603,6 +652,8 @@ impl eframe::App for PiezoMonitorApp {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    // Load environment variables from .env if present
+    dotenv().ok();
     println!("Starting Piezo Monitor");
     
     let options = eframe::NativeOptions {

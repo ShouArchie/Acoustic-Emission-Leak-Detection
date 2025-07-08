@@ -1,0 +1,4 @@
+numpy>=1.24
+PyQt6>=6.5
+pyqtgraph>=0.13
+psycopg2-binary>=2.9 

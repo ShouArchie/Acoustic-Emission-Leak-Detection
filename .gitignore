@@ -14,3 +14,6 @@ pico/CMakeLists.txt
 # Misc
 .DS_Store
 Thumbs.db
+# Docker compose overrides
+*.override.yml
+.env
