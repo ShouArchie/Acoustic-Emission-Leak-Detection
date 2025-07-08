@@ -1,6 +1,4 @@
-# Piezo Monitor
-
-**Real-time high-speed piezoelectric sensor visualizer**
+# **Real-time high-speed piezoelectric sensor with Pico**
 
 This application acquires 200 kHz voltage data from a Raspberry Pi Pico over USB, stores the stream in a lock-free circular buffer, and displays both the live waveform and its FFT using a Rust egui/eframe desktop GUI. 
 
