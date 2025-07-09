@@ -28,6 +28,7 @@ use dotenvy::dotenv;
 // postgres handled in db module
 
 mod db;
+mod inference;
 
 const BUFFER_SIZE: usize = 1_000_000; // 10 seconds at 200kHz
 const DISPLAY_SAMPLES: usize = 400_000; // Show last 0.5 seconds at 200kHz on screen
@@ -440,6 +441,10 @@ struct PiezoMonitorApp {
     fft_buffer: Vec<f32>,
     fft_output: Vec<f32>,
     fft_freqs: Vec<f64>,
+    // Inference
+    inference_engine: Option<inference::InferenceEngine>,
+    last_confidence: Option<f32>,
+    last_inference_time: Instant,
 }
 
 impl PiezoMonitorApp {
@@ -452,7 +457,14 @@ impl PiezoMonitorApp {
         let fft_freqs: Vec<f64> = (0..=FFT_SIZE/2)
             .map(|i| i as f64 * 60000.0 / FFT_SIZE as f64)
             .collect();
-        
+        // NEW: attempt to load latest TorchScript model
+        let inference_engine = match inference::InferenceEngine::load_latest() {
+            Ok(engine) => Some(engine),
+            Err(e) => {
+                println!("[Inference] Could not load model: {}", e);
+                None
+            }
+        };
         Self {
             collector: HighPerfDataCollector::new(),
             port_name: String::new(),
@@ -466,6 +478,9 @@ impl PiezoMonitorApp {
             fft_buffer,
             fft_output,
             fft_freqs,
+            inference_engine,
+            last_confidence: None,
+            last_inference_time: Instant::now(),
         }
     }
     
@@ -509,7 +524,36 @@ impl PiezoMonitorApp {
 impl eframe::App for PiezoMonitorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(UPDATE_RATE_MS));
-        
+
+        // Periodic model inference (every 5 s)
+        if let Some(engine) = &self.inference_engine {
+            if self.monitoring && self.last_inference_time.elapsed() >= Duration::from_secs(5) {
+                let samples: Vec<f32> = {
+                    let buf = self.collector.voltage_buffer.lock().unwrap();
+                    if buf.len() >= 1_000_000 {
+                        buf.iter()
+                            .skip(buf.len() - 1_000_000)
+                            .take(1_000_000)
+                            .copied()
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                };
+                if samples.len() == 1_000_000 {
+                    match engine.predict(&samples) {
+                        Ok(conf) => {
+                            self.last_confidence = Some(conf);
+                        }
+                        Err(e) => {
+                            println!("[Inference] Prediction error: {}", e);
+                        }
+                    }
+                    self.last_inference_time = Instant::now();
+                }
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Piezo Monitor");
             
@@ -556,6 +600,20 @@ impl eframe::App for PiezoMonitorApp {
                 ui.label(format!("📊 Samples: {}", total_samples));
                 ui.label(format!("📦 Batches: {}", batch_count));
                 ui.label(format!("⏱️ Rate: {:.0} Hz", est_rate));
+                if self.inference_engine.is_none() {
+                    ui.colored_label(egui::Color32::LIGHT_RED, "⚠️ No model loaded");
+                }
+                // Confidence display
+                if let Some(conf) = self.last_confidence {
+                    let color = if conf >= 0.8 {
+                        egui::Color32::GREEN
+                    } else if conf >= 0.5 {
+                        egui::Color32::YELLOW
+                    } else {
+                        egui::Color32::RED
+                    };
+                    ui.colored_label(color, format!("🤖 Conf: {:.0} %", conf * 100.0));
+                }
                 
                 let status_color = if since_last < 2.0 { egui::Color32::GREEN } else { egui::Color32::RED };
                 ui.colored_label(status_color, if since_last < 2.0 { "🟢 LIVE" } else { "🔴 STALE" });

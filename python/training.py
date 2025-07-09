@@ -106,69 +106,83 @@ def make_dataset() -> Tuple[np.ndarray, np.ndarray]:
     return X, y
 
 class WindowDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray):
+    """Return feature vectors only (labels unused for auto-encoder)."""
+    def __init__(self, X: np.ndarray):
         self.X = torch.from_numpy(X)
-        self.y = torch.from_numpy(y)
     def __len__(self):
-        return len(self.y)
+        return len(self.X)
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        return self.X[idx]
 
-class SimpleCNN(nn.Module):
+
+class AutoEncoder(nn.Module):
+    """A reasonably large 1-D convolutional auto-encoder.
+
+    Encoder downsamples the 200 k vector by factor 8 (≈25 k) and
+    compresses to 64 channels.  Decoder mirrors the process.
+    This keeps parameter count manageable while still expressive.
+    """
+
     def __init__(self, in_len: int):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=5, stride=2),
+        self.encoder = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=7, stride=2, padding=3),
             nn.ReLU(),
-            nn.Conv1d(16, 32, kernel_size=5, stride=2),
+            nn.Conv1d(32, 64, kernel_size=7, stride=2, padding=3),
             nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Linear(32, 1),
-            nn.Sigmoid(),
+            nn.Conv1d(64, 128, kernel_size=7, stride=2, padding=3),
+            nn.ReLU(),
         )
-    def forward(self, x):
-        x = x.unsqueeze(1)  # B,1,L
-        return self.net(x)
+
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose1d(128, 64, kernel_size=7, stride=2, padding=3, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose1d(64, 32, kernel_size=7, stride=2, padding=3, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose1d(32, 1, kernel_size=7, stride=2, padding=3, output_padding=1),
+        )
+
+        # Ensure output length matches input – if stride/padding math left an
+        # off-by-one, crop in forward.
+        self.in_len = in_len
+
+    def forward(self, x):  # x: (B, L)
+        z = self.encoder(x.unsqueeze(1))  # (B, C, L/8)
+        recon = self.decoder(z).squeeze(1)  # (B, L')
+        if recon.size(1) > self.in_len:
+            recon = recon[:, : self.in_len]
+        elif recon.size(1) < self.in_len:
+            pad = self.in_len - recon.size(1)
+            recon = nn.functional.pad(recon, (0, pad))
+        return recon
 
 def train():
-    X, y = make_dataset()
-    ds = WindowDataset(X, y)
-    train_size = int(0.8 * len(ds))
-    val_size = len(ds) - train_size
-    train_ds, val_ds = random_split(ds, [train_size, val_size])
-    loader = DataLoader(train_ds, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=32)
+    X, _ = make_dataset()  # labels ignored
+    ds = WindowDataset(X)
+    loader = DataLoader(ds, batch_size=8, shuffle=True)
 
-    model = SimpleCNN(X.shape[1])
+    model = AutoEncoder(X.shape[1])
     optim = torch.optim.Adam(model.parameters(), lr=1e-3)
-    loss_fn = nn.BCELoss()
+    loss_fn = nn.MSELoss()
 
-    print("Starting training …")
+    print("Starting auto-encoder training …")
     for epoch in range(EPOCHS):
         model.train()
-        running_loss = 0.0
-        for xb, yb in loader:
-            preds = model(xb.float()).squeeze()
-            loss = loss_fn(preds, yb.float())
+        running = 0.0
+        for xb in loader:
+            recon = model(xb.float())
+            loss = loss_fn(recon, xb.float())
             optim.zero_grad()
             loss.backward()
             optim.step()
-            running_loss += loss.item()
-        avg_loss = running_loss / len(loader)
-        # simple val loss
-        model.eval()
-        with torch.no_grad():
-            v_loss = 0.0
-            for xb, yb in val_loader:
-                preds = model(xb.float()).squeeze()
-                v_loss += loss_fn(preds, yb.float()).item()
-        print(f"Epoch {epoch+1}/{EPOCHS}: train_loss {avg_loss:.4f}  val_loss {v_loss/len(val_loader):.4f}")
+            running += loss.item()
+        print(f"Epoch {epoch+1}/{EPOCHS}: recon_loss {running/len(loader):.6f}")
+
     os.makedirs("models", exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M")
     fname = f"models/model_{ts}.pt"
     torch.save(model.state_dict(), fname)
-    print(f"Model saved to {fname}")
+    print(f"Auto-encoder saved to {fname}")
 
 if __name__ == "__main__":
     train() 

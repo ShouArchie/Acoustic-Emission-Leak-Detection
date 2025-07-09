@@ -14,3 +14,4 @@ ringbuffer = "0.15"
 realfft = "3.3" 
 postgres = "0.19"
 dotenvy = "0.15" 
+tch = { version = "0.20", features = ["download-libtorch"] } 
