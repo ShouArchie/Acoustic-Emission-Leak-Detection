@@ -17,4 +17,4 @@ Thumbs.db
 # Docker compose overrides
 *.override.yml
 .env
-models/
+# models/
