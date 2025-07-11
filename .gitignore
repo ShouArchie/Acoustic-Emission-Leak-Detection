@@ -1,11 +1,11 @@
 # Rust build artifacts
 rust/target/
-
+rust/Cargo.lock
 # Pico firmware build directory
 pico/build/
 
 pico/CMakeLists.txt
-
+models/
 # Firmware binaries (in case they appear elsewhere)
 
 *.bin
@@ -18,3 +18,4 @@ Thumbs.db
 *.override.yml
 .env
 # models/
+rust/Cargo.lock

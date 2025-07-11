@@ -1,6 +1,6 @@
-use crossbeam_channel::{Receiver};
+use crossbeam_channel::Receiver;
 use postgres::{Client, NoTls};
-use crate::DataBatch;
+use crate::{DataBatch, SAMPLES_PER_BATCH};
 use std::sync::{Arc, Mutex};
 
 pub fn start_db_writer(rx: Receiver<DataBatch>, conn_str: String) {
@@ -41,6 +41,9 @@ pub fn truncate_windows(conn_str: &str) {
     }
 }
 
+const WINDOW_SAMPLES: usize = 200_000; // 1-second window at 200 kHz
+const BATCHES_PER_WINDOW: usize = WINDOW_SAMPLES / SAMPLES_PER_BATCH; // 200_000/2000 = 100
+
 pub fn start_window_writer(rx: Receiver<DataBatch>, conn_str: String, collect_flag: Arc<Mutex<bool>>) {
     std::thread::spawn(move || {
         let mut client = match Client::connect(&conn_str, NoTls) {
@@ -48,7 +51,7 @@ pub fn start_window_writer(rx: Receiver<DataBatch>, conn_str: String, collect_fl
             Err(e) => { eprintln!("Window writer DB connect failed: {}", e); return; }
         };
 
-        let mut buffer: Vec<Vec<f32>> = Vec::with_capacity(500);
+        let mut buffer: Vec<Vec<f32>> = Vec::with_capacity(BATCHES_PER_WINDOW);
         let mut start_id: i32 = 0;
         loop {
             match rx.recv() {
@@ -61,9 +64,9 @@ pub fn start_window_writer(rx: Receiver<DataBatch>, conn_str: String, collect_fl
                         start_id = batch.batch_id as i32;
                     }
                     buffer.push(batch.voltages);
-                    if buffer.len() == 500 {
+                    if buffer.len() == BATCHES_PER_WINDOW {
                         // concatenate
-                        let mut window: Vec<f32> = Vec::with_capacity(1_000_000);
+                        let mut window: Vec<f32> = Vec::with_capacity(WINDOW_SAMPLES);
                         for v in &buffer { window.extend_from_slice(v); }
                         let _ = client.execute(
                             "INSERT INTO windows(start_batch_id, voltages) VALUES ($1,$2)",
@@ -71,7 +74,7 @@ pub fn start_window_writer(rx: Receiver<DataBatch>, conn_str: String, collect_fl
                         );
                         buffer.clear();
 
-                        static MAX_WINDOWS: u32 = 180;
+                        static MAX_WINDOWS: u32 = 1800;
                         let mut inserted = client.query_one("SELECT count(*) FROM windows", &[]).unwrap();
                         let total: i64 = inserted.get(0);
                         if total as u32 >= MAX_WINDOWS {

@@ -25,6 +25,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use ringbuffer::{AllocRingBuffer, RingBuffer};
 use realfft::RealFftPlanner;
 use dotenvy::dotenv;
+use std::path::{Path, PathBuf};
 // postgres handled in db module
 
 mod db;
@@ -443,42 +444,50 @@ struct PiezoMonitorApp {
     fft_freqs: Vec<f64>,
     // Inference
     inference_engine: Option<inference::InferenceEngine>,
+    model_path: Option<String>,
+    model_enabled: bool,
     last_confidence: Option<f32>,
     last_inference_time: Instant,
 }
 
 impl PiezoMonitorApp {
     fn new() -> Self {
-        let fft_planner = RealFftPlanner::new();
-        let fft_buffer = vec![0.0; FFT_SIZE];
-        let fft_output = vec![0.0; FFT_SIZE / 2 + 1];
+        dotenv().ok();
         
-        // Pre-calculate frequency bins for 60kHz
-        let fft_freqs: Vec<f64> = (0..=FFT_SIZE/2)
-            .map(|i| i as f64 * 60000.0 / FFT_SIZE as f64)
-            .collect();
-        // NEW: attempt to load latest TorchScript model
-        let inference_engine = match inference::InferenceEngine::load_latest() {
-            Ok(engine) => Some(engine),
+        let port_name = HighPerfDataCollector::find_pico_port().unwrap_or_else(|| "NONE".to_string());
+        let collector = HighPerfDataCollector::new();
+
+        let (inference_engine, model_path) = match inference::InferenceEngine::load_latest() {
+            Ok((engine, path)) => {
+                println!("[main] Inference engine loaded successfully.");
+                (Some(engine), Some(path.to_string_lossy().to_string()))
+            }
             Err(e) => {
-                println!("[Inference] Could not load model: {}", e);
-                None
+                println!("[main] Failed to load inference engine: {}", e);
+                (None, None)
             }
         };
+
+        let freqs = (0..=FFT_SIZE / 2)
+            .map(|i| i as f64 * (200_000.0 / FFT_SIZE as f64))
+            .collect();
+            
         Self {
-            collector: HighPerfDataCollector::new(),
-            port_name: String::new(),
+            collector,
+            port_name,
             connected: false,
             monitoring: false,
-            downsample_factor: 1,
+            downsample_factor: 200,
             auto_scale: true,
             show_fft: true,
             collecting_training: false,
-            fft_planner,
-            fft_buffer,
-            fft_output,
-            fft_freqs,
+            fft_planner: RealFftPlanner::new(),
+            fft_buffer: vec![0.0; FFT_SIZE],
+            fft_output: vec![0.0; FFT_SIZE/2 + 1],
+            fft_freqs: freqs,
             inference_engine,
+            model_path,
+            model_enabled: false,
             last_confidence: None,
             last_inference_time: Instant::now(),
         }
@@ -525,9 +534,9 @@ impl eframe::App for PiezoMonitorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(UPDATE_RATE_MS));
 
-        // Periodic model inference (every 5 s)
+        // Periodic model inference (every 100 ms)
         if let Some(engine) = &self.inference_engine {
-            if self.monitoring && self.last_inference_time.elapsed() >= Duration::from_secs(5) {
+            if self.monitoring && self.last_inference_time.elapsed() >= Duration::from_millis(100) {
                 let samples: Vec<f32> = {
                     let buf = self.collector.voltage_buffer.lock().unwrap();
                     if buf.len() >= 1_000_000 {
@@ -541,15 +550,17 @@ impl eframe::App for PiezoMonitorApp {
                     }
                 };
                 if samples.len() == 1_000_000 {
-                    match engine.predict(&samples) {
-                        Ok(conf) => {
-                            self.last_confidence = Some(conf);
+                    if self.model_enabled {
+                        match engine.predict(&samples) {
+                            Ok(conf) => {
+                                self.last_confidence = Some(conf);
+                            }
+                            Err(e) => {
+                                println!("[Inference] Prediction error: {}", e);
+                            }
                         }
-                        Err(e) => {
-                            println!("[Inference] Prediction error: {}", e);
-                        }
+                        self.last_inference_time = Instant::now();
                     }
-                    self.last_inference_time = Instant::now();
                 }
             }
         }
@@ -592,6 +603,7 @@ impl eframe::App for PiezoMonitorApp {
                 
                 ui.checkbox(&mut self.auto_scale, "Auto Scale");
                 ui.checkbox(&mut self.show_fft, "Show FFT");
+                ui.checkbox(&mut self.model_enabled, "Enable Model");
             });
             
             // Statistics
@@ -704,6 +716,45 @@ impl eframe::App for PiezoMonitorApp {
                 ui.centered_and_justified(|ui| {
                     ui.label("📡 Waiting for data from Pico...");
                 });
+            }
+
+            ui.separator();
+            ui.heading("Leak Detection");
+
+            if self.inference_engine.is_some() {
+                if let Some(path) = &self.model_path {
+                    ui.horizontal(|ui| {
+                        ui.label("Model:");
+                        let filename = Path::new(path).file_name().unwrap_or_default();
+                        ui.colored_label(egui::Color32::from_rgb(100, 149, 237), filename.to_string_lossy());
+                    });
+                }
+
+                let (confidence, color) = match self.last_confidence {
+                    Some(c) => {
+                        let color = if c >= 0.5 {
+                            egui::Color32::GREEN
+                        } else {
+                            egui::Color32::RED
+                        };
+                        (format!("{:.1}%", c * 100.0), color)
+                    }
+                    None => ("---".to_string(), egui::Color32::GRAY),
+                };
+
+                ui.horizontal(|ui| {
+                    ui.label("Confidence:");
+                    ui.colored_label(color, confidence);
+                });
+
+                let bar_fill = self.last_confidence.unwrap_or(0.0);
+                let bar = egui::ProgressBar::new(bar_fill)
+                    .desired_width(120.0)
+                    .fill(color);
+                ui.add(bar);
+
+            } else {
+                ui.label("Model not loaded.");
             }
         });
     }
