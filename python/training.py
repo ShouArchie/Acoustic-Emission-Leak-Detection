@@ -35,9 +35,19 @@ NUM_BINS_SPECTRO = high_bin - low_bin  # Should be ~36,045 bins
 # GPU-friendly hyperparameters
 EPOCHS = 20  # Increased for better training
 BATCH_SIZE = 64 # Larger batch size for GPU
-LEARNING_RATE = 1e-4
-VALIDATION_SPLIT = 0.2 # 20% of data for validation
-EARLY_STOP_PATIENCE = 3 # Stop if val loss doesn't improve for 3 epochs
+TRAIN_FRAC = 0.70
+VAL_FRAC   = 0.15
+TEST_FRAC  = 0.15
+
+EARLY_STOP_PATIENCE = 5  # epochs without improvement
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
+
+# --- Training mode selector ---
+# 0 = train both auto-encoders
+# 1 = train time-domain auto-encoder only
+# 2 = train FFT / spectrogram auto-encoder only
+TRAIN_MODE = 2
 
 
 def get_windows() -> List[np.ndarray]:
@@ -208,13 +218,16 @@ def train():
     time_dataset = VoltageDataset(X_time)
     spectro_dataset = SpectroDataset(X_spectro)
 
-    # Split datasets into train/val
-    val_size = int(len(time_dataset) * VALIDATION_SPLIT)
-    train_size = len(time_dataset) - val_size
-    time_train, time_val = random_split(time_dataset, [train_size, val_size])
-    spectro_train, spectro_val = random_split(spectro_dataset, [train_size, val_size])
-    
-    print(f" splitting into {len(time_train)} training samples and {len(time_val)} validation samples.")
+    # Split into train/val/test
+    total = len(time_dataset)
+    train_size = int(total * TRAIN_FRAC)
+    val_size   = int(total * VAL_FRAC)
+    test_size  = total - train_size - val_size
+
+    time_train, time_val, time_test = random_split(time_dataset, [train_size, val_size, test_size])
+    spectro_train, spectro_val, spectro_test = random_split(spectro_dataset, [train_size, val_size, test_size])
+
+    print(f" Dataset split: {train_size} train | {val_size} val | {test_size} test")
 
     time_loader = DataLoader(
         time_train,
@@ -229,8 +242,9 @@ def train():
         pin_memory=True,
     )
 
-    spectro_loader = DataLoader(spectro_train, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
-    spectro_val_loader = DataLoader(spectro_val, batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
+    spectro_loader      = DataLoader(spectro_train, batch_size=BATCH_SIZE, shuffle=True,  pin_memory=True)
+    spectro_val_loader  = DataLoader(spectro_val,   batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
+    spectro_test_loader = DataLoader(spectro_test,  batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
 
     # --- 3. Initialize Models ---
     time_model = ConvAutoEncoder1D(DS_LEN).to(device)
@@ -275,8 +289,8 @@ def train():
 
     loss_fn = nn.MSELoss()
 
-    optim_time = torch.optim.Adam(time_model.parameters(), lr=LEARNING_RATE)
-    optim_spectro = torch.optim.Adam(spectro_model.parameters(), lr=LEARNING_RATE)
+    optim_time    = torch.optim.AdamW(time_model.parameters(),    lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    optim_spectro = torch.optim.AdamW(spectro_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
     print("🚀 Starting autoencoder training...")
     best_val_loss = float('inf')
@@ -284,9 +298,11 @@ def train():
     epochs_no_improve = 0
     
     # --- 4. Training Loop ---
-    def train_one(model, optim, train_loader, val_loader, tag):
-        best_val = float('inf'); best_path=None
-        for epoch in range(EPOCHS):
+    def train_one(model, optim, train_loader, val_loader, test_loader, tag):
+        best_val = float('inf'); best_path=None; epochs_no_improve=0
+        epoch=0
+        while True:
+            epoch +=1
             model.train(); tot=0.0
             for xb in train_loader:
                 xb = xb.to(device, non_blocking=True)
@@ -302,9 +318,9 @@ def train():
                     val_loss = loss_fn(model(xb), xb)
                     tot_v += val_loss.item()
             avg_val = tot_v/len(val_loader)
-            print(f"[{tag}] Epoch {epoch+1}/{EPOCHS} | Train {avg_train:.6f} | Val {avg_val:.6f}")
+            print(f"[{tag}] Epoch {epoch} | Train {avg_train:.6f} | Val {avg_val:.6f}")
 
-            if avg_val < best_val:
+            if avg_val < best_val - 1e-6:
                 best_val = avg_val
                 # delete old
                 if best_path and os.path.exists(best_path):
@@ -313,14 +329,40 @@ def train():
                 best_path = str(MODELS_DIR / f"autoencoder_{tag}_best_{ts}.pt")
                 torch.save(model.state_dict(), best_path)
                 print(f"   ✨ saved {best_path}")
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve +=1
+
+            if epochs_no_improve >= EARLY_STOP_PATIENCE:
+                print(f"   ⏹ Early stopping after {epoch} epochs (no val improvement)")
+                break
+
+        # Evaluate on test set
+        model.eval(); tot_t=0.0
+        with torch.no_grad():
+            for xb in test_loader:
+                xb = xb.to(device, non_blocking=True)
+                tot_t += loss_fn(model(xb), xb).item()
+        print(f"[{tag}] Test MSE: {tot_t/len(test_loader):.6f}")
 
     # create models dir
     from pathlib import Path
     MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
     MODELS_DIR.mkdir(exist_ok=True)
 
-    train_one(time_model, optim_time, time_loader, time_val_loader, tag="time")
-    train_one(spectro_model, optim_spectro, spectro_loader, spectro_val_loader, tag="spectro")
+    if TRAIN_MODE in (0, 1):
+        train_one(
+            time_model, optim_time,
+            time_loader, time_val_loader,
+            DataLoader(time_test, batch_size=BATCH_SIZE, shuffle=False),
+            tag="time")
+
+    if TRAIN_MODE in (0, 2):
+        train_one(
+            spectro_model, optim_spectro,
+            spectro_loader, spectro_val_loader, spectro_test_loader,
+            tag="spectro")
+
     print("🏁 Training complete for both models.")
 
 if __name__ == "__main__":

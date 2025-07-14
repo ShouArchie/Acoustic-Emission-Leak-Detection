@@ -1,12 +1,11 @@
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::io::Write;
-
 use tch::{kind::Kind, CModule, Tensor};
 use tch::IValue;
-use serde_json::Value;
+
+use realfft::RealFftPlanner;
+use realfft::num_complex::Complex32;
 
 // --- Constants (must match python/training.py) ---
 const WINDOW_SEC: f32 = 1.0;
@@ -17,92 +16,73 @@ const DS_LEN: usize = WINDOW_SAMPLES / DOWNSAMPLE_FACTOR; // 200,000 downsampled
 
 pub struct InferenceEngine {
     time_model: CModule,
-    ml_service_available: bool,
+    spectro_model: CModule,
 }
 
 impl InferenceEngine {
-    pub fn new<P: AsRef<Path>>(time_path: P) -> Result<Self, Box<dyn Error>> {
+    pub fn new<P: AsRef<Path>, Q: AsRef<Path>>(time_path: P, spectro_path: Q) -> Result<Self, Box<dyn Error>> {
         let time_model = CModule::load(time_path.as_ref())?;
         println!("[Inference] Loaded time model {}", time_path.as_ref().display());
-        
-        // Check if ML service is available
-        let ml_available = Self::check_ml_service();
-        if ml_available {
-            println!("[Inference] ML spectral service available");
-        } else {
-            println!("[Inference] ML spectral service not available, using time-only inference");
-        }
-        
+
+        let spectro_model = CModule::load(spectro_path.as_ref())?;
+        println!("[Inference] Loaded spectro model {}", spectro_path.as_ref().display());
+
         Ok(Self { 
-            time_model, 
-            ml_service_available: ml_available 
+            time_model,
+            spectro_model,
         })
     }
 
     pub fn load_latest() -> Result<(Self, PathBuf), Box<dyn Error>> {
         let time_path = find_latest_ts("autoencoder_time_best_*.ts").ok_or("No time .ts found")?;
-        Self::new(&time_path).map(|e| (e, time_path))
+        let spectro_path = find_latest_ts("autoencoder_spectro_best_*.ts").ok_or("No spectro .ts found")?;
+        Self::new(&time_path, &spectro_path).map(|e| (e, time_path))
     }
     
-    fn check_ml_service() -> bool {
-        // Check if Python and required packages are available
-        match Command::new("python")
-            .arg("-c")
-            .arg("import sklearn, numpy, pickle; print('OK')")
-            .output() 
-        {
-            Ok(output) => {
-                let result = String::from_utf8_lossy(&output.stdout);
-                result.trim() == "OK"
+    // Helper to compute spectrogram features matching the training pipeline
+    fn compute_spectro_features(&self, window: &[f32]) -> Vec<f32> {
+        const NFFT: usize = 131_072;
+        const FFT_LOW_HZ: f32 = 5_000.0;
+        const FFT_HIGH_HZ: f32 = 60_000.0;
+
+        let freq_resolution = SAMPLE_RATE / NFFT as f32;
+        let low_bin = (FFT_LOW_HZ / freq_resolution).floor() as usize;
+        let high_bin = (FFT_HIGH_HZ / freq_resolution).floor() as usize;
+        let num_bins = high_bin - low_bin;
+
+        // Prepare input of length NFFT (take latest samples)
+        let mut buf = vec![0.0f32; NFFT];
+        let start = window.len().saturating_sub(NFFT);
+        buf.copy_from_slice(&window[start..start + NFFT]);
+
+        // FFT
+        let mut planner = RealFftPlanner::<f32>::new();
+        let rfft = planner.plan_fft_forward(NFFT);
+        let mut spectrum: Vec<Complex32> = rfft.make_output_vec();
+        rfft.process(&mut buf, &mut spectrum).unwrap();
+
+        // Magnitude and slice band
+        let mut mags: Vec<f32> = spectrum.iter().map(|c| c.norm()).collect();
+        mags.truncate(high_bin + 1);
+        mags.drain(0..low_bin);
+
+        // Ensure exact length
+        if mags.len() > num_bins {
+            mags.truncate(num_bins);
+        } else if mags.len() < num_bins {
+            mags.extend(std::iter::repeat(0.0).take(num_bins - mags.len()));
+        }
+
+        // Normalize to [-1,1]
+        if let Some(maxv) = mags.iter().cloned().fold(None, |acc, v| {
+            Some(acc.map_or(v, |m: f32| m.max(v)))
+        }) {
+            if maxv > 0.0 {
+                for v in mags.iter_mut() { *v /= maxv; }
             }
-            Err(_) => false
         }
-    }
-    
-    fn call_ml_service(&self, window: &[f32]) -> Result<(f32, f32, f32), Box<dyn Error>> {
-        // Save signal to temporary file
-        let temp_dir = std::env::temp_dir();
-        let signal_file = temp_dir.join("signal_temp.npy");
-        
-        // Convert to numpy format and save
-        // For simplicity, we'll write as CSV and read in Python
-        let csv_file = temp_dir.join("signal_temp.csv");
-        let mut file = std::fs::File::create(&csv_file)?;
-        for (i, &value) in window.iter().enumerate() {
-            if i > 0 { write!(file, ",")?; }
-            write!(file, "{}", value)?;
-        }
-        writeln!(file)?;
-        
-        // Call Python ML service
-        let python_script = Path::new("../python/ml_inference_service.py");
-        let output = Command::new("python")
-            .arg(python_script)
-            .arg(&csv_file)
-            .output()?;
-        
-        // Clean up temp file
-        let _ = std::fs::remove_file(&csv_file);
-        
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("ML service failed: {}", stderr).into());
-        }
-        
-        // Parse JSON response
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let result: Value = serde_json::from_str(&stdout)?;
-        
-        if !result["success"].as_bool().unwrap_or(false) {
-            let error = result["error"].as_str().unwrap_or("Unknown error");
-            return Err(format!("ML prediction failed: {}", error).into());
-        }
-        
-        let conf_combined = result["confidence_combined"].as_f64().unwrap_or(0.5) as f32;
-        let conf_if = result["confidence_isolation_forest"].as_f64().unwrap_or(0.5) as f32;
-        let conf_svm = result["confidence_one_class_svm"].as_f64().unwrap_or(0.5) as f32;
-        
-        Ok((conf_combined, conf_if, conf_svm))
+
+        mags
     }
 
     pub fn predict(&self, window: &[f32]) -> Result<(f32, f32, f32), Box<dyn Error>> {
@@ -137,28 +117,32 @@ impl InferenceEngine {
         const THRESH_TIME: f64 = 0.001;
         let conf_time = (THRESH_TIME / (THRESH_TIME + mse_time)).clamp(0.0, 1.0) as f32;
 
-        // ML spectral inference
-        let (conf_ml, conf_if, conf_svm) = if self.ml_service_available {
-            match self.call_ml_service(window) {
-                Ok(result) => result,
-                Err(e) => {
-                    println!("[Inference] ML service error: {}", e);
-                    (0.5, 0.5, 0.5) // Fallback values
-                }
-            }
-        } else {
-            (0.5, 0.5, 0.5) // No ML service available
-        };
+        // Spectrogram inference using local auto-encoder
+        let spectro_features = self.compute_spectro_features(window);
+        let input_spectro = Tensor::from_slice(&spectro_features).to_kind(Kind::Float).unsqueeze(0);
+
+        let recon_spec: Tensor = self
+            .spectro_model
+            .forward_is(&[IValue::from(input_spectro.copy())])?
+            .try_into()?;
+
+        let diff_spec = recon_spec - input_spectro;
+        let mse_spec = diff_spec.pow_tensor_scalar(2.0).mean(Kind::Float).double_value(&[]);
+
+        const THRESH_SPEC: f64 = 0.001;
+        let conf_spec = (THRESH_SPEC / (THRESH_SPEC + mse_spec)).clamp(0.0, 1.0) as f32;
+
+        let conf_ml = conf_spec; // rename for compatibility
 
         // Combined confidence (weighted average of time and ML)
-        const TIME_WEIGHT: f32 = 0.4;
-        const ML_WEIGHT: f32 = 0.6;
-        let conf_combined = TIME_WEIGHT * conf_time + ML_WEIGHT * conf_ml;
+        const TIME_WEIGHT: f32 = 0.5;
+        const SPEC_WEIGHT: f32 = 0.5;
+        let conf_combined = TIME_WEIGHT * conf_time + SPEC_WEIGHT * conf_ml;
 
-        println!("[Inf] mse_t={:.3e} | conf_t={:.2} conf_ml={:.2} (IF:{:.2} SVM:{:.2}) conf_c={:.2}",
-            mse_time, conf_time, conf_ml, conf_if, conf_svm, conf_combined);
+        println!("[Inf] mse_t={:.3e} | conf_t={:.2} conf_s={:.2} conf_c={:.2}",
+            mse_time, conf_time, conf_ml, conf_combined);
         
-        // Return (combined, time, ml_combined)
+        // Return (combined, time, spectro)
         Ok((conf_combined, conf_time, conf_ml))
     }
 }
