@@ -25,7 +25,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use ringbuffer::{AllocRingBuffer, RingBuffer};
 use realfft::RealFftPlanner;
 use dotenvy::dotenv;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 // postgres handled in db module
 
 mod db;
@@ -447,6 +447,8 @@ struct PiezoMonitorApp {
     model_path: Option<String>,
     model_enabled: bool,
     last_confidence: Option<f32>,
+    last_conf_time: Option<f32>,
+    last_conf_ml: Option<f32>,
     last_inference_time: Instant,
 }
 
@@ -458,9 +460,11 @@ impl PiezoMonitorApp {
         let collector = HighPerfDataCollector::new();
 
         let (inference_engine, model_path) = match inference::InferenceEngine::load_latest() {
-            Ok((engine, path)) => {
+            Ok((engine, time_path)) => {
                 println!("[main] Inference engine loaded successfully.");
-                (Some(engine), Some(path.to_string_lossy().to_string()))
+                let disp = format!("Time: {} | ML: Available",
+                    time_path.file_name().unwrap().to_string_lossy());
+                (Some(engine), Some(disp))
             }
             Err(e) => {
                 println!("[main] Failed to load inference engine: {}", e);
@@ -489,6 +493,8 @@ impl PiezoMonitorApp {
             model_path,
             model_enabled: false,
             last_confidence: None,
+            last_conf_time: None,
+            last_conf_ml: None,
             last_inference_time: Instant::now(),
         }
     }
@@ -552,8 +558,10 @@ impl eframe::App for PiezoMonitorApp {
                 if samples.len() == 1_000_000 {
                     if self.model_enabled {
                         match engine.predict(&samples) {
-                            Ok(conf) => {
-                                self.last_confidence = Some(conf);
+                            Ok((c_combo,c_time,c_ml)) => {
+                                self.last_confidence = Some(c_combo);
+                                self.last_conf_time = Some(c_time);
+                                self.last_conf_ml = Some(c_ml);
                             }
                             Err(e) => {
                                 println!("[Inference] Prediction error: {}", e);
@@ -752,6 +760,15 @@ impl eframe::App for PiezoMonitorApp {
                     .desired_width(120.0)
                     .fill(color);
                 ui.add(bar);
+
+                if let (Some(ct),Some(cm)) = (self.last_conf_time,self.last_conf_ml) {
+                    ui.horizontal(|ui|{
+                        ui.label("Time:");
+                        ui.colored_label(egui::Color32::GRAY, format!("{:.0}%", ct*100.0));
+                        ui.label("ML:");
+                        ui.colored_label(egui::Color32::GRAY, format!("{:.0}%", cm*100.0));
+                    });
+                }
 
             } else {
                 ui.label("Model not loaded.");

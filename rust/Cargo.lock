@@ -2620,6 +2620,7 @@ dependencies = [
  "postgres",
  "realfft",
  "ringbuffer",
+ "serde_json",
  "serialport",
  "tch",
 ]

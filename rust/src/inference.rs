@@ -1,9 +1,12 @@
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::io::Write;
 
 use tch::{kind::Kind, CModule, Tensor};
 use tch::IValue;
+use serde_json::Value;
 
 // --- Constants (must match python/training.py) ---
 const WINDOW_SEC: f32 = 1.0;
@@ -11,74 +14,156 @@ const SAMPLE_RATE: f32 = 200_000.0;
 const DOWNSAMPLE_FACTOR: usize = 1;
 const WINDOW_SAMPLES: usize = (WINDOW_SEC * SAMPLE_RATE) as usize; // 200,000 raw samples
 const DS_LEN: usize = WINDOW_SAMPLES / DOWNSAMPLE_FACTOR; // 200,000 downsampled
-// FFT constants
-const NFFT: usize = 131_072;
-const FFT_LOW_HZ: f32 = 5_000.0;
-const FFT_HIGH_HZ: f32 = 60_000.0;
-const NUM_BINS: usize = 200;
 
 pub struct InferenceEngine {
-    model: CModule,
+    time_model: CModule,
+    ml_service_available: bool,
 }
 
 impl InferenceEngine {
-    pub fn new<P: AsRef<Path>>(model_path: P) -> Result<Self, Box<dyn Error>> {
-        let model = CModule::load(model_path.as_ref())?;
-        println!("[Inference] Loaded TorchScript model from {}", model_path.as_ref().display());
-        Ok(Self { model })
+    pub fn new<P: AsRef<Path>>(time_path: P) -> Result<Self, Box<dyn Error>> {
+        let time_model = CModule::load(time_path.as_ref())?;
+        println!("[Inference] Loaded time model {}", time_path.as_ref().display());
+        
+        // Check if ML service is available
+        let ml_available = Self::check_ml_service();
+        if ml_available {
+            println!("[Inference] ML spectral service available");
+        } else {
+            println!("[Inference] ML spectral service not available, using time-only inference");
+        }
+        
+        Ok(Self { 
+            time_model, 
+            ml_service_available: ml_available 
+        })
     }
 
     pub fn load_latest() -> Result<(Self, PathBuf), Box<dyn Error>> {
-        let path = find_latest_model().ok_or("No autoencoder_1d_best*.ts model found")?;
-        let engine = Self::new(path.clone())?;
-        Ok((engine, path))
+        let time_path = find_latest_ts("autoencoder_time_best_*.ts").ok_or("No time .ts found")?;
+        Self::new(&time_path).map(|e| (e, time_path))
+    }
+    
+    fn check_ml_service() -> bool {
+        // Check if Python and required packages are available
+        match Command::new("python")
+            .arg("-c")
+            .arg("import sklearn, numpy, pickle; print('OK')")
+            .output() 
+        {
+            Ok(output) => {
+                let result = String::from_utf8_lossy(&output.stdout);
+                result.trim() == "OK"
+            }
+            Err(_) => false
+        }
+    }
+    
+    fn call_ml_service(&self, window: &[f32]) -> Result<(f32, f32, f32), Box<dyn Error>> {
+        // Save signal to temporary file
+        let temp_dir = std::env::temp_dir();
+        let signal_file = temp_dir.join("signal_temp.npy");
+        
+        // Convert to numpy format and save
+        // For simplicity, we'll write as CSV and read in Python
+        let csv_file = temp_dir.join("signal_temp.csv");
+        let mut file = std::fs::File::create(&csv_file)?;
+        for (i, &value) in window.iter().enumerate() {
+            if i > 0 { write!(file, ",")?; }
+            write!(file, "{}", value)?;
+        }
+        writeln!(file)?;
+        
+        // Call Python ML service
+        let python_script = Path::new("../python/ml_inference_service.py");
+        let output = Command::new("python")
+            .arg(python_script)
+            .arg(&csv_file)
+            .output()?;
+        
+        // Clean up temp file
+        let _ = std::fs::remove_file(&csv_file);
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("ML service failed: {}", stderr).into());
+        }
+        
+        // Parse JSON response
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let result: Value = serde_json::from_str(&stdout)?;
+        
+        if !result["success"].as_bool().unwrap_or(false) {
+            let error = result["error"].as_str().unwrap_or("Unknown error");
+            return Err(format!("ML prediction failed: {}", error).into());
+        }
+        
+        let conf_combined = result["confidence_combined"].as_f64().unwrap_or(0.5) as f32;
+        let conf_if = result["confidence_isolation_forest"].as_f64().unwrap_or(0.5) as f32;
+        let conf_svm = result["confidence_one_class_svm"].as_f64().unwrap_or(0.5) as f32;
+        
+        Ok((conf_combined, conf_if, conf_svm))
     }
 
-    pub fn predict(&self, window: &[f32]) -> Result<f32, Box<dyn Error>> {
+    pub fn predict(&self, window: &[f32]) -> Result<(f32, f32, f32), Box<dyn Error>> {
         if window.len() < WINDOW_SAMPLES {
             return Err(format!("Window too short: got {}, expected {}", window.len(), WINDOW_SAMPLES).into());
         }
 
-        // Prepare input tensor exactly as in Python
+        // Time-domain inference
         let mut input_vec = downsample(&window[window.len() - WINDOW_SAMPLES..]);
-        let fft_bins = compute_fft_bins(&input_vec);
-        input_vec.extend(fft_bins);
-        normalize(&mut input_vec);
         
-        let input_tensor = Tensor::from_slice(&input_vec)
-            .to_kind(Kind::Float)
-            .unsqueeze(0); // Shape: [1, 200056]
+        // Normalize time data
+        let max_time = input_vec.iter().fold(0.0f32, |max, &val| val.abs().max(max));
+        if max_time > 0.0 {
+            for val in input_vec.iter_mut() {
+                *val /= max_time;
+            }
+        }
 
-        // Run inference
-        let out = self.model.forward_is(&[IValue::from(input_tensor.copy())])?;
-        let recon: Tensor = out.try_into()?;
-        
-        // Calculate Mean Squared Error for reconstruction
-        let diff = recon - &input_tensor;
-        // Split diff into time-domain part and FFT-bin part
-        let diff_time = diff.narrow(1, 0, DS_LEN as i64);
-        let diff_fft  = diff.narrow(1, DS_LEN as i64, NUM_BINS as i64);
+        // Create input tensor for time model
+        let input_time = Tensor::from_slice(&input_vec).to_kind(Kind::Float).unsqueeze(0);
 
+        // Run time model
+        let recon_time: Tensor = self
+            .time_model
+            .forward_is(&[IValue::from(input_time.copy())])?
+            .try_into()?;
+
+        let diff_time = recon_time - input_time;
         let mse_time = diff_time.pow_tensor_scalar(2.0).mean(Kind::Float).double_value(&[]);
-        let mse_fft  = diff_fft.pow_tensor_scalar(2.0).mean(Kind::Float).double_value(&[]);
 
-        // Give FFT error a higher weight to make tonal anomalies more visible
-        const FFT_WEIGHT: f64 = 5.0;  // tune as needed
-        let mse = mse_time + FFT_WEIGHT * mse_fft;
+        // Time confidence
+        const THRESH_TIME: f64 = 0.001;
+        let conf_time = (THRESH_TIME / (THRESH_TIME + mse_time)).clamp(0.0, 1.0) as f32;
 
-        // Debug log
-        println!("[Inference] mse_time={:.6e} mse_fft={:.6e} (weighted) mse_total={:.6e}", mse_time, mse_fft, mse);
-        // Simple threshold mapping to get a "confidence" score (0=anomaly, 1=normal)
-        // This threshold might need retuning now that we weight FFT heavily.
-        const THRESH: f64 = 0.01; 
-        let conf = (THRESH / (THRESH + mse)).clamp(0.0, 1.0) as f32;
+        // ML spectral inference
+        let (conf_ml, conf_if, conf_svm) = if self.ml_service_available {
+            match self.call_ml_service(window) {
+                Ok(result) => result,
+                Err(e) => {
+                    println!("[Inference] ML service error: {}", e);
+                    (0.5, 0.5, 0.5) // Fallback values
+                }
+            }
+        } else {
+            (0.5, 0.5, 0.5) // No ML service available
+        };
+
+        // Combined confidence (weighted average of time and ML)
+        const TIME_WEIGHT: f32 = 0.4;
+        const ML_WEIGHT: f32 = 0.6;
+        let conf_combined = TIME_WEIGHT * conf_time + ML_WEIGHT * conf_ml;
+
+        println!("[Inf] mse_t={:.3e} | conf_t={:.2} conf_ml={:.2} (IF:{:.2} SVM:{:.2}) conf_c={:.2}",
+            mse_time, conf_time, conf_ml, conf_if, conf_svm, conf_combined);
         
-        println!("[Inference] Recon MSE: {:.6} | Confidence: {:.3}", mse, conf);
-        Ok(conf)
+        // Return (combined, time, ml_combined)
+        Ok((conf_combined, conf_time, conf_ml))
     }
 }
 
-fn find_latest_model() -> Option<PathBuf> {
+fn find_latest_ts(pattern: &str) -> Option<PathBuf> {
     const CANDIDATES: &[&str] = &["models", "../models"];
 
     for dir in CANDIDATES {
@@ -87,7 +172,7 @@ fn find_latest_model() -> Option<PathBuf> {
                 .filter_map(Result::ok)
                 .filter(|e| {
                     e.path().extension().map_or(false, |ext| ext == "ts") &&
-                    e.file_name().to_string_lossy().starts_with("autoencoder_1d")
+                    e.file_name().to_string_lossy().starts_with(pattern.trim_end_matches("*.ts"))
                 })
                 .max_by_key(|e| e.metadata().ok().and_then(|m| m.modified().ok()));
             
@@ -99,56 +184,11 @@ fn find_latest_model() -> Option<PathBuf> {
     None
 }
 
-/// Compute FFT bins matching Python
-fn compute_fft_bins(raw: &[f32]) -> Vec<f32> {
-    use realfft::RealFftPlanner;
-    let fft = RealFftPlanner::<f32>::new().plan_fft_forward(NFFT);
-    let mut input = vec![0.0f32; NFFT];
-    let copy_len = raw.len().min(NFFT);
-    input[0..copy_len].copy_from_slice(&raw[0..copy_len]);
-    let mut spectrum = fft.make_output_vec();
-    fft.process(&mut input, &mut spectrum).unwrap();
-
-    let bin_freq = SAMPLE_RATE / NFFT as f32;
-    let mut band: Vec<f32> = spectrum.iter().enumerate().filter_map(|(i, c)| {
-        let freq = i as f32 * bin_freq;
-        if freq >= FFT_LOW_HZ && freq <= FFT_HIGH_HZ {
-            Some((c.re * c.re + c.im * c.im).sqrt())
-        } else {
-            None
-        }
-    }).collect();
-
-    let bin_size = band.len() / NUM_BINS;
-    let trim_len = bin_size * NUM_BINS;
-    band.truncate(trim_len);
-
-    let mut fft_bins = Vec::with_capacity(NUM_BINS);
-    for i in 0..NUM_BINS {
-        let start = i * bin_size;
-        let end = start + bin_size;
-        let avg = band[start..end].iter().sum::<f32>() / bin_size as f32;
-        fft_bins.push(avg);
-    }
-    fft_bins
-}
-
 /// Downsample the raw signal by taking every Nth sample.
-/// This matches the Python `decimate` function's behavior for this use case.
 fn downsample(raw: &[f32]) -> Vec<f32> {
     raw.iter()
         .step_by(DOWNSAMPLE_FACTOR)
         .cloned()
         .take(DS_LEN)
         .collect()
-}
-
-/// Normalize the data to the [-1, 1] range, matching the Python script.
-fn normalize(data: &mut [f32]) {
-    let max_abs = data.iter().fold(0.0f32, |max, &val| val.abs().max(max));
-    if max_abs > 0.0 {
-        for val in data.iter_mut() {
-            *val /= max_abs;
-        }
-    }
 } 
