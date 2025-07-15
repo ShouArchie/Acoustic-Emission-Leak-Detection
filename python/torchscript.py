@@ -127,14 +127,14 @@ def convert(pt_path: str, model: nn.Module):
 
 def main():
     time_pt = _find_latest("autoencoder_time_best_*.pt")
-    spectro_pt = _find_latest("autoencoder_spectro_best_*.pt")
+    spectro_pt = _find_latest("dsvdd_spectro_best_*.pt")
 
     if not time_pt or not spectro_pt:
         print("❌ Could not find both time and spectro checkpoints", file=sys.stderr)
         sys.exit(1)
 
     convert(time_pt, ConvAutoEncoder1D(200_000))
-    convert(spectro_pt, SpectroAutoEncoder(NUM_BINS_SPECTRO))
+    convert(spectro_pt, SpectroAutoEncoder(55_000))
 
 
 if __name__ == "__main__":

@@ -7,6 +7,13 @@ use tch::IValue;
 use realfft::RealFftPlanner;
 use realfft::num_complex::Complex32;
 
+// --- Spectrogram bucketing constants (must match python/training.py) ---
+const FFT_LOW_HZ_USIZE: usize = 200;   // 200 Hz lower bound
+const FFT_HIGH_HZ_USIZE: usize = 100_000; // 100 kHz upper bound
+const BUCKET_HZ: usize = 25;           // bucket width
+const NUM_BINS_SPECTRO: usize = (FFT_HIGH_HZ_USIZE - FFT_LOW_HZ_USIZE) / BUCKET_HZ; // 3_992
+const UPWEIGHT_BINS: usize = (5_000 - FFT_LOW_HZ_USIZE) / BUCKET_HZ; // first 192 buckets
+
 // --- Constants (must match python/training.py) ---
 const WINDOW_SEC: f32 = 1.0;
 const SAMPLE_RATE: f32 = 200_000.0;
@@ -16,7 +23,7 @@ const DS_LEN: usize = WINDOW_SAMPLES / DOWNSAMPLE_FACTOR; // 200,000 downsampled
 
 pub struct InferenceEngine {
     time_model: CModule,
-    spectro_model: CModule,
+    spectro_model: CModule, // Deep SVDD wrapper
 }
 
 impl InferenceEngine {
@@ -35,22 +42,16 @@ impl InferenceEngine {
 
     pub fn load_latest() -> Result<(Self, PathBuf), Box<dyn Error>> {
         let time_path = find_latest_ts("autoencoder_time_best_*.ts").ok_or("No time .ts found")?;
-        let spectro_path = find_latest_ts("autoencoder_spectro_best_*.ts").ok_or("No spectro .ts found")?;
+        let spectro_path = find_latest_ts("autoencoder_spectro_best_*.ts").ok_or("No spectro AE .ts found")?;
         Self::new(&time_path, &spectro_path).map(|e| (e, time_path))
     }
     
     // Helper to compute spectrogram features matching the training pipeline
     fn compute_spectro_features(&self, window: &[f32]) -> Vec<f32> {
-        const NFFT: usize = 131_072;
-        const FFT_LOW_HZ: f32 = 5_000.0;
-        const FFT_HIGH_HZ: f32 = 60_000.0;
+        // 1-second FFT at 1 Hz resolution, then average 25 Hz buckets
+        const NFFT: usize = WINDOW_SAMPLES; // 200 000
 
-        let freq_resolution = SAMPLE_RATE / NFFT as f32;
-        let low_bin = (FFT_LOW_HZ / freq_resolution).floor() as usize;
-        let high_bin = (FFT_HIGH_HZ / freq_resolution).floor() as usize;
-        let num_bins = high_bin - low_bin;
-
-        // Prepare input of length NFFT (take latest samples)
+        // Prepare buffer (latest 1 s) and zero-pad/trim to NFFT
         let mut buf = vec![0.0f32; NFFT];
         let start = window.len().saturating_sub(NFFT);
         buf.copy_from_slice(&window[start..start + NFFT]);
@@ -61,28 +62,32 @@ impl InferenceEngine {
         let mut spectrum: Vec<Complex32> = rfft.make_output_vec();
         rfft.process(&mut buf, &mut spectrum).unwrap();
 
-        // Magnitude and slice band
-        let mut mags: Vec<f32> = spectrum.iter().map(|c| c.norm()).collect();
-        mags.truncate(high_bin + 1);
-        mags.drain(0..low_bin);
+        let mags: Vec<f32> = spectrum.iter().map(|c| c.norm()).collect(); // len 100 001
 
-        // Ensure exact length
-        if mags.len() > num_bins {
-            mags.truncate(num_bins);
-        } else if mags.len() < num_bins {
-            mags.extend(std::iter::repeat(0.0).take(num_bins - mags.len()));
+        // Bucket-average every 25 Hz from 200 Hz → 100 kHz
+        let mut features: Vec<f32> = Vec::with_capacity(NUM_BINS_SPECTRO);
+        for i in 0..NUM_BINS_SPECTRO {
+            let start_hz = FFT_LOW_HZ_USIZE + i * BUCKET_HZ;
+            let end_hz = start_hz + BUCKET_HZ;
+            let slice = &mags[start_hz..end_hz.min(mags.len())];
+            let mean = if !slice.is_empty() {
+                slice.iter().sum::<f32>() / slice.len() as f32
+            } else { 0.0 };
+            features.push(mean);
         }
 
-        // Normalize to [-1,1]
-        if let Some(maxv) = mags.iter().cloned().fold(None, |acc, v| {
-            Some(acc.map_or(v, |m: f32| m.max(v)))
-        }) {
-            if maxv > 0.0 {
-                for v in mags.iter_mut() { *v /= maxv; }
+        // Normalize to [0,1]
+        let maxv = features
+            .iter()
+            .cloned()
+            .fold(0.0_f32, |m, v| m.max(v));
+        if maxv > 0.0 {
+            for v in features.iter_mut() {
+                *v /= maxv;
             }
         }
 
-        mags
+        features
     }
 
     pub fn predict(&self, window: &[f32]) -> Result<(f32, f32, f32), Box<dyn Error>> {
@@ -121,29 +126,35 @@ impl InferenceEngine {
         let spectro_features = self.compute_spectro_features(window);
         let input_spectro = Tensor::from_slice(&spectro_features).to_kind(Kind::Float).unsqueeze(0);
 
+        // Spectro auto-encoder reconstruction
         let recon_spec: Tensor = self
             .spectro_model
             .forward_is(&[IValue::from(input_spectro.copy())])?
             .try_into()?;
 
         let diff_spec = recon_spec - input_spectro;
-        let mse_spec = diff_spec.pow_tensor_scalar(2.0).mean(Kind::Float).double_value(&[]);
+
+        // Weighted MSE
+        let mut weights = vec![1.0f32; NUM_BINS_SPECTRO];
+        for w in &mut weights[..UPWEIGHT_BINS] { *w = 5.0; }
+        let w_tensor = Tensor::from_slice(&weights).to_kind(Kind::Float).unsqueeze(0);
+
+        let mse_spec = (diff_spec.pow_tensor_scalar(2.0) * &w_tensor)
+            .sum(Kind::Float)
+            .double_value(&[]) / w_tensor.sum(Kind::Float).double_value(&[]);
 
         const THRESH_SPEC: f64 = 0.001;
         let conf_spec = (THRESH_SPEC / (THRESH_SPEC + mse_spec)).clamp(0.0, 1.0) as f32;
 
-        let conf_ml = conf_spec; // rename for compatibility
-
-        // Combined confidence (weighted average of time and ML)
+        // Combined confidence
         const TIME_WEIGHT: f32 = 0.5;
         const SPEC_WEIGHT: f32 = 0.5;
-        let conf_combined = TIME_WEIGHT * conf_time + SPEC_WEIGHT * conf_ml;
+        let conf_combined = TIME_WEIGHT * conf_time + SPEC_WEIGHT * conf_spec;
 
-        println!("[Inf] mse_t={:.3e} | conf_t={:.2} conf_s={:.2} conf_c={:.2}",
-            mse_time, conf_time, conf_ml, conf_combined);
+        println!("[Inf] mse_t={:.3e} mse_s={:.3e} | conf_t={:.2} conf_spec={:.2} conf_c={:.2}",
+            mse_time, mse_spec, conf_time, conf_spec, conf_combined);
         
-        // Return (combined, time, spectro)
-        Ok((conf_combined, conf_time, conf_ml))
+        Ok((conf_combined, conf_time, conf_spec))
     }
 }
 

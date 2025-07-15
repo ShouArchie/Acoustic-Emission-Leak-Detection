@@ -31,9 +31,10 @@ use std::path::Path;
 mod db;
 mod inference;
 
-const BUFFER_SIZE: usize = 1_000_000; // 10 seconds at 200kHz
-const DISPLAY_SAMPLES: usize = 400_000; // Show last 0.5 seconds at 200kHz on screen
-const FFT_SIZE: usize = 8192;
+// Use a 1-second window (200 000 samples @ 200 kHz) for FFT display
+const FFT_SIZE: usize = 200_000;          // RealFFT handles non-power-of-two
+const BUFFER_SIZE: usize = 300_000;       // ring-buffer (>1 s)
+const DISPLAY_SAMPLES: usize = FFT_SIZE;  // time & FFT window
 const UPDATE_RATE_MS: u64 = 16; // 60fps update for screen
 
 const SAMPLES_PER_BATCH: usize = 2000; // Must match firmware (0.01s batches)
@@ -487,7 +488,7 @@ impl PiezoMonitorApp {
             collecting_training: false,
             fft_planner: RealFftPlanner::new(),
             fft_buffer: vec![0.0; FFT_SIZE],
-            fft_output: vec![0.0; FFT_SIZE/2 + 1],
+            fft_output: vec![0.0; FFT_SIZE / 2 + 1],
             fft_freqs: freqs,
             inference_engine,
             model_path,
@@ -521,14 +522,13 @@ impl PiezoMonitorApp {
         
         let sample_rate = self.collector.sample_rate; // current configured SR
 
-        // Convert to magnitude and assemble points limited to 10-100 kHz
+        // Convert to magnitude and keep < 200 Hz band
         spectrum.iter()
             .enumerate()
-            .take(FFT_SIZE / 2)
-            .skip(1)
+            .take(FFT_SIZE / 2) // positive frequencies
             .filter_map(|(i, complex)| {
-                let freq = i as f64 * sample_rate / FFT_SIZE as f64;
-                if freq < 10_000.0 || freq > 100_000.0 { return None; }
+                let freq = i as f64 * sample_rate / FFT_SIZE as f64; // up to Nyquist
+                if freq < 200.0 || freq > 20_000.0 { return None; }
                 let magnitude = (complex.re * complex.re + complex.im * complex.im).sqrt() as f64;
                 if magnitude > 1e-6 { Some([freq, magnitude]) } else { None }
             })
@@ -545,17 +545,17 @@ impl eframe::App for PiezoMonitorApp {
             if self.monitoring && self.last_inference_time.elapsed() >= Duration::from_millis(100) {
                 let samples: Vec<f32> = {
                     let buf = self.collector.voltage_buffer.lock().unwrap();
-                    if buf.len() >= 1_000_000 {
+                    if buf.len() >= FFT_SIZE {
                         buf.iter()
-                            .skip(buf.len() - 1_000_000)
-                            .take(1_000_000)
+                            .skip(buf.len() - FFT_SIZE)
+                            .take(FFT_SIZE)
                             .copied()
                             .collect()
                     } else {
                         Vec::new()
                     }
                 };
-                if samples.len() == 1_000_000 {
+                if samples.len() == FFT_SIZE {
                     if self.model_enabled {
                         match engine.predict(&samples) {
                             Ok((c_combo,c_time,c_ml)) => {

@@ -22,15 +22,18 @@ DOWNSAMPLE_FACTOR = 1  # No downsampling for higher resolution
 DS_RATE = SAMPLE_RATE // DOWNSAMPLE_FACTOR  # 200 kHz
 DS_LEN = int(WINDOW_SEC * DS_RATE)      # 200,000 samples
 
-# FFT Hyperparameters
-NFFT = 131_072  # FFT size (power of 2 for efficiency)
-FFT_LOW_HZ = 5_000.0
-FFT_HIGH_HZ = 60_000.0
-# Calculate actual bins available in frequency range
-freq_resolution = DS_RATE / NFFT
-low_bin = int(FFT_LOW_HZ / freq_resolution)
-high_bin = int(FFT_HIGH_HZ / freq_resolution)
-NUM_BINS_SPECTRO = high_bin - low_bin  # Should be ~36,045 bins
+# FFT Hyperparameters – 1 Hz resolution over the 1-second window
+# Use NFFT = 200 000 so each FFT bin ≈ 1 Hz (SAMPLE_RATE / NFFT)
+NFFT = 200_000
+FFT_LOW_HZ = 200.0
+FFT_HIGH_HZ = 100_000.0
+
+# --- New spectral setup ---
+# Average every 25 Hz bin from 200 Hz → 100 kHz
+BUCKET_HZ = 25
+NUM_BINS_SPECTRO = int((FFT_HIGH_HZ - FFT_LOW_HZ) / BUCKET_HZ)  # (100k-200)/25 = 3992
+FINE_BINS_HIGH_HZ = 5_000.0   # Up-weighted range upper bound
+NUM_UPWEIGHT = int((FINE_BINS_HIGH_HZ - FFT_LOW_HZ) / BUCKET_HZ)  # (5000-200)/25 = 192
 
 # GPU-friendly hyperparameters
 EPOCHS = 20  # Increased for better training
@@ -47,7 +50,7 @@ WEIGHT_DECAY = 1e-4
 # 0 = train both auto-encoders
 # 1 = train time-domain auto-encoder only
 # 2 = train FFT / spectrogram auto-encoder only
-TRAIN_MODE = 2
+TRAIN_MODE = 0
 
 
 def get_windows() -> List[np.ndarray]:
@@ -101,26 +104,29 @@ def make_dataset() -> np.ndarray:
     ds_windows = slices  # Already at full resolution
     ds_windows = [arr[:DS_LEN] for arr in ds_windows]  # Ensure exact length
 
-    # 4. Compute FFT features for each window
-    print("⏳ Computing FFT features...")
+    # 4. Compute FFT-based spectral features
+    print("⏳ Computing FFT features…")
     features = []
     for ds in ds_windows:
-        # Compute FFT on the raw downsampled data
+        # FFT (1 Hz resolution) and magnitude
         fft_result = np.fft.rfft(ds, n=NFFT)
-        freqs = np.fft.rfftfreq(NFFT, d=1.0 / DS_RATE)
+        mags = np.abs(fft_result)  # len 100 001
 
-        # Filter frequencies in the range
-        mask = (freqs >= FFT_LOW_HZ) & (freqs <= FFT_HIGH_HZ)
-        band = np.abs(fft_result[mask])
+        # Bucket-average every 25 Hz from 200 Hz → 100 kHz
+        buckets = []
+        start_bin = int(FFT_LOW_HZ)  # 200
+        for i in range(NUM_BINS_SPECTRO):
+            bin_start = start_bin + i * BUCKET_HZ
+            bin_end   = bin_start + BUCKET_HZ
+            bucket_vals = mags[bin_start:bin_end]
+            buckets.append(bucket_vals.mean() if bucket_vals.size else 0.0)
 
-        # Use full spectrum - no binning for 55k bins
-        if len(band) >= NUM_BINS_SPECTRO:
-            spectro_bins = band[:NUM_BINS_SPECTRO]
-        else:
-            # Pad with zeros if needed
-            spectro_bins = np.pad(band, (0, NUM_BINS_SPECTRO - len(band)), 'constant')
+        spectro_bins = np.asarray(buckets, dtype=np.float32)
 
-        # Concatenate downsampled time data + spectro bins
+        # Sanity check / pad if rare rounding issues
+        if spectro_bins.size < NUM_BINS_SPECTRO:
+            spectro_bins = np.pad(spectro_bins, (0, NUM_BINS_SPECTRO - spectro_bins.size))
+
         combined = np.concatenate([ds, spectro_bins])
         features.append(combined)
 
@@ -247,103 +253,91 @@ def train():
     spectro_test_loader = DataLoader(spectro_test,  batch_size=BATCH_SIZE, shuffle=False, pin_memory=True)
 
     # --- 3. Initialize Models ---
-    time_model = ConvAutoEncoder1D(DS_LEN).to(device)
-
-    class SpectroAutoEncoder(nn.Module):
-        def __init__(self, input_len=NUM_BINS_SPECTRO):
-            super().__init__()
-            self.encoder = nn.Sequential(
-                nn.Conv1d(1, 16, kernel_size=7, stride=2, padding=3), # (B, 1, L) -> (B, 16, L/2)
-                nn.ReLU(),
-                nn.Conv1d(16, 32, kernel_size=7, stride=2, padding=3), # (B, 16, L/2) -> (B, 32, L/4)
-                nn.ReLU(),
-                nn.Conv1d(32, 64, kernel_size=7, stride=2, padding=3), # (B, 32, L/4) -> (B, 64, L/8)
-                nn.ReLU(),
-            )
-            self.decoder = nn.Sequential(
-                nn.ConvTranspose1d(64, 32, kernel_size=7, stride=2, padding=3, output_padding=1),
-                nn.ReLU(),
-                nn.ConvTranspose1d(32, 16, kernel_size=7, stride=2, padding=3, output_padding=1),
-                nn.ReLU(),
-                nn.ConvTranspose1d(16, 1, kernel_size=7, stride=2, padding=3, output_padding=1),
-                nn.Tanh()
-            )
-            self.input_len = input_len
-            
-        def forward(self, x):  # Input shape: (Batch, Length)
-            # Add a channel dimension for Conv1D
-            x = x.unsqueeze(1) # (B, 1, L)
-            
-            z = self.encoder(x)
-            recon = self.decoder(z)
-            
-            # Remove channel dimension
-            recon = recon.squeeze(1) # (B, L)
-
-            # Ensure output length matches input, cropping if necessary
-            if recon.size(1) > self.input_len:
-                recon = recon[:, : self.input_len]
-            return recon
-
-    spectro_model = SpectroAutoEncoder().to(device)
-
-    loss_fn = nn.MSELoss()
+    time_model    = ConvAutoEncoder1D(DS_LEN).to(device)
+    spectro_model = ConvAutoEncoder1D(NUM_BINS_SPECTRO).to(device)
 
     optim_time    = torch.optim.AdamW(time_model.parameters(),    lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     optim_spectro = torch.optim.AdamW(spectro_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    print("🚀 Starting autoencoder training...")
-    best_val_loss = float('inf')
-    best_model_path = None
-    epochs_no_improve = 0
-    
-    # --- 4. Training Loop ---
-    def train_one(model, optim, train_loader, val_loader, test_loader, tag):
-        best_val = float('inf'); best_path=None; epochs_no_improve=0
-        epoch=0
+    # Shared loss
+    loss_fn = nn.MSELoss(reduction="none")  # we'll apply weights manually
+
+    # Precompute spectral weights (tensor on device)
+    weights_np = np.ones(NUM_BINS_SPECTRO, dtype=np.float32)
+    weights_np[:NUM_UPWEIGHT] = 5.0  # up-weight 200 Hz – 5 kHz region
+    weights_tensor = torch.from_numpy(weights_np).to(device)
+
+    # --- General training helper for an auto-encoder ---
+    def train_one(model, optim, train_loader, val_loader, test_loader, tag: str):
+        """Train a single auto-encoder with early stopping and TorchScript export."""
+        best_val = float('inf')
+        best_path: str | None = None
+        epochs_no_improve = 0
+        epoch = 0
+
         while True:
-            epoch +=1
-            model.train(); tot=0.0
+            epoch += 1
+            model.train(); total_train = 0.0
             for xb in train_loader:
                 xb = xb.to(device, non_blocking=True)
                 recon = model(xb)
-                loss = loss_fn(recon, xb)
-                optim.zero_grad(); loss.backward(); optim.step(); tot += loss.item()
-            avg_train = tot/len(train_loader)
+                raw = loss_fn(recon, xb)  # shape (B, L)
+                if tag == "spectro":
+                    weighted = raw * weights_tensor  # broadcast (1,L)
+                    loss = weighted.sum() / weights_tensor.sum() / raw.size(0)
+                else:
+                    loss = raw.mean()
+                optim.zero_grad(); loss.backward(); optim.step()
+                total_train += loss.item()
+            avg_train = total_train / len(train_loader)
 
-            model.eval(); tot_v=0.0
+            # Validation
+            model.eval(); total_val = 0.0
             with torch.no_grad():
                 for xb in val_loader:
                     xb = xb.to(device, non_blocking=True)
-                    val_loss = loss_fn(model(xb), xb)
-                    tot_v += val_loss.item()
-            avg_val = tot_v/len(val_loader)
+                    recon_v = model(xb)
+                    raw_v = loss_fn(recon_v, xb)
+                    if tag == "spectro":
+                        val_loss = (raw_v * weights_tensor).sum() / weights_tensor.sum()
+                    else:
+                        val_loss = raw_v.mean()
+                    total_val += val_loss.item()
+            avg_val = total_val / len(val_loader)
             print(f"[{tag}] Epoch {epoch} | Train {avg_train:.6f} | Val {avg_val:.6f}")
 
+            # Check for improvement
             if avg_val < best_val - 1e-6:
-                best_val = avg_val
-                # delete old
+                best_val = avg_val; epochs_no_improve = 0
+                # Remove previous best
                 if best_path and os.path.exists(best_path):
                     os.remove(best_path)
-                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-                best_path = str(MODELS_DIR / f"autoencoder_{tag}_best_{ts}.pt")
-                torch.save(model.state_dict(), best_path)
+                ts_stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+                best_path = str(MODELS_DIR / f"autoencoder_{tag}_best_{ts_stamp}.ts")
+                scripted = torch.jit.script(model.cpu())
+                scripted.save(best_path)
+                model.to(device)
                 print(f"   ✨ saved {best_path}")
-                epochs_no_improve = 0
             else:
-                epochs_no_improve +=1
+                epochs_no_improve += 1
 
             if epochs_no_improve >= EARLY_STOP_PATIENCE:
                 print(f"   ⏹ Early stopping after {epoch} epochs (no val improvement)")
                 break
 
         # Evaluate on test set
-        model.eval(); tot_t=0.0
+        model.eval(); total_test = 0.0
         with torch.no_grad():
             for xb in test_loader:
                 xb = xb.to(device, non_blocking=True)
-                tot_t += loss_fn(model(xb), xb).item()
-        print(f"[{tag}] Test MSE: {tot_t/len(test_loader):.6f}")
+                recon_t = model(xb)
+                raw_t = loss_fn(recon_t, xb)
+                if tag == "spectro":
+                    test_loss = (raw_t * weights_tensor).sum() / weights_tensor.sum()
+                else:
+                    test_loss = raw_t.mean()
+                total_test += test_loss.item()
+        print(f"[{tag}] Test MSE: {total_test / len(test_loader):.6f}")
 
     # create models dir
     from pathlib import Path
@@ -356,11 +350,13 @@ def train():
             time_loader, time_val_loader,
             DataLoader(time_test, batch_size=BATCH_SIZE, shuffle=False),
             tag="time")
-
+ 
+    # --------- Spectro auto-encoder training loop ---------
     if TRAIN_MODE in (0, 2):
         train_one(
             spectro_model, optim_spectro,
-            spectro_loader, spectro_val_loader, spectro_test_loader,
+            spectro_loader, spectro_val_loader,
+            spectro_test_loader,
             tag="spectro")
 
     print("🏁 Training complete for both models.")
