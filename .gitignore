@@ -20,3 +20,6 @@ Thumbs.db
 .env
 # models/
 rust/Cargo.lock
+# local postgres config
+postgresql.conf
+pg_hba.conf

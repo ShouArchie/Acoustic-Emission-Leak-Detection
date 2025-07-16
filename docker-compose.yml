@@ -10,9 +10,12 @@ services:
       POSTGRES_PASSWORD: pass
       POSTGRES_DB: piezo_data
     ports:
-      - "5432:5432" 
+      - "5432:5432"
     volumes:
       - db-data:/var/lib/postgresql/data
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c hba_file=/etc/postgresql/pg_hba.conf
 
 volumes:
   db-data: 

@@ -1,7 +1,7 @@
 import os
 import math
 from typing import Tuple, List
-
+# debug: using external postgres at 192.168.10.212
 import numpy as np
 import psycopg2
 from scipy.signal import decimate
@@ -12,8 +12,8 @@ import time
 from collections import deque
 import datetime
 
-# --- Hyperparameters ---
-DSN = os.getenv("DATABASE_URL", "postgres://pico:pass@localhost:5432/piezo_data")
+# Params
+DSN = os.getenv("DATABASE_URL", "postgres://pico:pass@192.168.10.212:5432/piezo_data")
 WINDOW_SEC = 1.0
 SLIDE_SEC = 0.1                # Stride for data augmentation
 SAMPLE_RATE = 200_000
@@ -57,9 +57,10 @@ TRAIN_MODE = 0
 
 def get_windows() -> List[np.ndarray]:
     """Fetch all 'voltages' arrays from the windows table."""
+    print(f"[debug] attempting db connect via {DSN}")
     try:
         conn = psycopg2.connect(DSN)
-        print("✅ Connected to PostgreSQL.")
+        print("✅ connected to postgres host ✔")
     except psycopg2.OperationalError as e:
         print(f"❌ Could not connect to PostgreSQL: {e}")
         print("Please ensure the Docker container is running and the DSN is correct.")
