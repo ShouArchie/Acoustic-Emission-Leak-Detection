@@ -5,7 +5,8 @@ rust/Cargo.lock
 pico/build/
 
 pico/CMakeLists.txt
-models/
+models/OLD
+models/WORKING OLD
 # Firmware binaries (in case they appear elsewhere)
 
 *.bin

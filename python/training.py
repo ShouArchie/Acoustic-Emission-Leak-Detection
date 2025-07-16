@@ -36,13 +36,15 @@ FINE_BINS_HIGH_HZ = 5_000.0   # Up-weighted range upper bound
 NUM_UPWEIGHT = int((FINE_BINS_HIGH_HZ - FFT_LOW_HZ) / BUCKET_HZ)  # (5000-200)/25 = 192
 
 # GPU-friendly hyperparameters
-EPOCHS = 20  # Increased for better training
+# --- Training schedule ---
+# Train up to 50 epochs, with early stopping after 7 epochs without improvement.
+EPOCHS = 50
 BATCH_SIZE = 64 # Larger batch size for GPU
 TRAIN_FRAC = 0.70
 VAL_FRAC   = 0.15
 TEST_FRAC  = 0.15
 
-EARLY_STOP_PATIENCE = 5  # epochs without improvement
+EARLY_STOP_PATIENCE = 7  # epochs without improvement
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 
@@ -275,7 +277,7 @@ def train():
         epochs_no_improve = 0
         epoch = 0
 
-        while True:
+        while epoch < EPOCHS:
             epoch += 1
             model.train(); total_train = 0.0
             for xb in train_loader:
